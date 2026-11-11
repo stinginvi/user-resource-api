@@ -22,14 +22,14 @@ os.environ["DATABASE_URL"] = urlunsplit(_parts._replace(path="/learn_test"))
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
-from app.db import pool
+from app.db import engine
 from app.main import app
 
 
 @pytest.fixture(scope="session")
 def client():
-    # with 才会触发 lifespan：打开连接池
     with TestClient(app) as c:
         yield c
 
@@ -37,8 +37,6 @@ def client():
 @pytest.fixture(autouse=True)
 def clean_db(client):
     """每个测试开始前清空表并重置自增 id，测试之间互不影响。"""
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE notes, users RESTART IDENTITY CASCADE")
-        conn.commit()
+    with engine.begin() as conn:
+        conn.execute(text("TRUNCATE notes, users RESTART IDENTITY CASCADE"))
     yield

@@ -19,3 +19,6 @@ CREATE TABLE notes (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 外键不会自动建索引：没有这一行，「查某个用户的笔记」会全表扫描
+CREATE INDEX idx_notes_user_id ON notes (user_id);

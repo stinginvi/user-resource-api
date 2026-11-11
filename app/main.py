@@ -11,10 +11,10 @@ from datetime import datetime
 
 from fastapi import FastAPI, Request
 
-from app.db import pool
+from app.db import engine
 from app.errors import register_error_handlers
 from app.logging_conf import setup_logging
-from app.routers import notes, users
+from app.routers import auth, notes, users
 
 setup_logging()
 logger = logging.getLogger("app.http")
@@ -22,10 +22,9 @@ logger = logging.getLogger("app.http")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用启动时打开连接池，关闭时关掉所有连接。"""
-    pool.open()
+    """应用关闭时释放连接池。"""
     yield
-    pool.close()
+    engine.dispose()
 
 
 app = FastAPI(
@@ -60,6 +59,7 @@ async def log_requests(request: Request, call_next):
     return response
 
 
+app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(notes.router)
 
