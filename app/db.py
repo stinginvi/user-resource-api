@@ -1,16 +1,14 @@
-"""数据库连接池。
+"""数据库：Engine + Session。
 
-为什么要池：
-- 建一条连接要 TCP 握手 + 身份认证，几十毫秒
-- 每个请求都建一条，高并发时数据库连接数会爆掉
-- 池子维护一组已经建好的连接：借一条、用完还回来、不重新登录
+SQLAlchemy 自带连接池，不再需要手写 psycopg_pool。
+一个请求一个 Session，请求结束自动 close。
 """
 
 import os
 
 from dotenv import load_dotenv
-from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
 
 load_dotenv()
 
@@ -18,17 +16,29 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("缺少 DATABASE_URL，请检查项目根目录的 .env")
 
-# open=False：导入时不连接，等应用启动再打开（lifespan 里做）
-pool = ConnectionPool(
-    conninfo=DATABASE_URL,
-    min_size=1,      # 平时至少保持 1 条空闲连接
-    max_size=10,     # 最多同时 10 条，超出的请求排队
-    kwargs={"row_factory": dict_row},
-    open=False,
+# SQLAlchemy 需要一个驱动名：postgresql+psycopg 表示用 psycopg 3
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=5,        # 常驻连接
+    max_overflow=10,    # 高峰期最多再借 10 条
+    pool_pre_ping=True, # 借出前先探活，避免用到已断开的连接
+)
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False,
+    expire_on_commit=False,  # commit 后对象属性仍可读，不需要再查一次
 )
 
 
-def get_conn():
-    """FastAPI 依赖：从池里借一条连接，请求结束后归还。"""
-    with pool.connection() as conn:
-        yield conn
+def get_db():
+    """FastAPI 依赖：每个请求一个 Session，用完关闭。"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
