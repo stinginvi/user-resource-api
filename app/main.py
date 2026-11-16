@@ -24,7 +24,7 @@ logger = logging.getLogger("app.http")
 async def lifespan(app: FastAPI):
     """应用关闭时释放连接池。"""
     yield
-    engine.dispose()
+    await engine.dispose()
 
 
 app = FastAPI(

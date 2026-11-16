@@ -20,12 +20,22 @@ if not _base:
 _parts = urlsplit(_base)
 os.environ["DATABASE_URL"] = urlunsplit(_parts._replace(path="/learn_test"))
 
-import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import text
+# 测试用 15 号库，和开发用的 0 号库隔离
+os.environ["REDIS_URL"] = "redis://127.0.0.1:6379/15"
 
-from app.db import engine
+import psycopg
+import pytest
+import redis
+from fastapi.testclient import TestClient
+
 from app.main import app
+
+TEST_DB_URL = os.environ["DATABASE_URL"]
+
+# 同步客户端只在 fixture 里用于清库，避免和异步引擎跨事件循环
+_sync_redis = redis.Redis.from_url(
+    os.environ["REDIS_URL"], decode_responses=True, protocol=2
+)
 
 
 @pytest.fixture(scope="session")
@@ -36,7 +46,9 @@ def client():
 
 @pytest.fixture(autouse=True)
 def clean_db(client):
-    """每个测试开始前清空表并重置自增 id，测试之间互不影响。"""
-    with engine.begin() as conn:
-        conn.execute(text("TRUNCATE notes, users RESTART IDENTITY CASCADE"))
+    """每个测试开始前清空数据库和 Redis，测试之间互不影响。"""
+    with psycopg.connect(TEST_DB_URL) as conn:
+        conn.execute("TRUNCATE notes, users RESTART IDENTITY CASCADE")
+        conn.commit()
+    _sync_redis.flushdb()
     yield

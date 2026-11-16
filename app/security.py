@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from fastapi import Depends
 from fastapi.security import OAuth2PasswordBearer
 from pwdlib import PasswordHash
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.errors import AppError
@@ -58,9 +58,9 @@ def decode_access_token(token: str) -> int:
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 
-def get_current_user(
+async def get_current_user(
     token: str = Depends(oauth2_scheme),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> User:
     """鉴权依赖：token 无效 → 401；有效 → 返回当前用户。"""
     try:
@@ -68,7 +68,7 @@ def get_current_user(
     except jwt.PyJWTError:
         raise AppError(401, "INVALID_TOKEN", "token 无效或已过期") from None
 
-    user = db.get(User, user_id)
+    user = await db.get(User, user_id)
     if user is None:
         raise AppError(401, "INVALID_TOKEN", "用户不存在")
     return user

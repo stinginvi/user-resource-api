@@ -1,9 +1,9 @@
 """注册、登录与密码存储测试。"""
 
-from sqlalchemy import select
+import os
 
-from app.db import SessionLocal
-from app.models import User
+import psycopg
+
 from app.security import decode_access_token
 
 PASSWORD = "password123"
@@ -41,13 +41,14 @@ def test_register_duplicate(client):
 
 def test_password_is_stored_hashed(client):
     _register(client)
-    db = SessionLocal()
-    try:
-        user = db.scalar(select(User).where(User.username == "alice"))
-        assert user.password_hash != PASSWORD
-        assert user.password_hash.startswith("$argon2")
-    finally:
-        db.close()
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        row = conn.execute(
+            "SELECT password_hash FROM users WHERE username = 'alice'"
+        ).fetchone()
+
+    assert row is not None
+    assert row[0] != PASSWORD
+    assert row[0].startswith("$argon2")
 
 
 def test_login_success(client):
