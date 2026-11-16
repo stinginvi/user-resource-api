@@ -1,6 +1,6 @@
 # user-resource-api
 
-用 FastAPI + PostgreSQL 实现的「用户与笔记」REST 服务。P1 项目：完整的 CRUD、JWT 鉴权、资源权限、分页、统一错误响应和接口测试。
+用 FastAPI + PostgreSQL + Redis 实现的「用户与笔记」REST 服务。P1 项目：完整的 CRUD、JWT 鉴权、资源权限、分页、缓存、全链路异步、统一错误响应和接口测试。
 
 ## 功能
 
@@ -8,6 +8,8 @@
 - **用户**：查列表（limit）、查单个、改名、删除
 - **笔记**：创建、分页列出、查单个、修改、删除
 - **权限**：登录用户只能读写自己的笔记；删除用户时笔记级联删除
+- **缓存**：用户详情走 Redis，cache-aside + 空值缓存 + 互斥锁 + 随机 TTL
+- **异步**：async 路由 + AsyncSession（asyncpg）+ redis.asyncio
 - **输入校验**：全部由 Pydantic 负责，错误返回统一结构
 - **日志**：每个请求记录方法、路径、状态码、耗时
 
@@ -17,23 +19,40 @@
 |---|---|
 | FastAPI | Web 框架、自动 OpenAPI 文档 |
 | Pydantic v2 | 请求/响应校验 |
-| SQLAlchemy 2.x | ORM、连接池、事务 |
+| SQLAlchemy 2.x（async） | ORM、连接池、事务 |
+| asyncpg | PostgreSQL 异步驱动 |
 | Alembic | 数据库迁移 |
 | PostgreSQL 18 | 数据存储 |
+| Redis | 缓存 |
 | pwdlib + argon2 | 密码哈希 |
 | PyJWT | 签发和校验 token |
 | pytest + httpx | 接口测试 |
 
 ## 快速开始
 
-### 1. 准备数据库
+### 1. 准备 PostgreSQL
 
 ```bash
 psql -U postgres -h 127.0.0.1 -c "CREATE DATABASE learn"
 psql -U postgres -h 127.0.0.1 -c "CREATE DATABASE learn_test"
 ```
 
-### 2. 安装依赖
+### 2. 准备 Redis
+
+Windows 版：
+
+```bash
+# 安装后作为服务运行，默认端口 6379
+redis-cli ping
+```
+
+Docker：
+
+```bash
+docker run -d --name redis -p 6379:6379 redis:7-alpine
+```
+
+### 3. 安装依赖
 
 ```bash
 python -m venv .venv
@@ -41,13 +60,14 @@ source .venv/Scripts/activate     # Windows Git Bash
 pip install -r requirements.txt
 ```
 
-### 3. 配置环境变量
+### 4. 配置环境变量
 
 在项目根目录创建 `.env`：
 
 ```
 DATABASE_URL=postgresql://postgres:你的密码@127.0.0.1:5432/learn
-SECRET_KEY=随便生成一段足够长的随机字符串
+SECRET_KEY=一段足够长的随机字符串
+REDIS_URL=redis://127.0.0.1:6379/0
 ```
 
 生成密钥：
@@ -56,16 +76,13 @@ SECRET_KEY=随便生成一段足够长的随机字符串
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-### 4. 建表（用迁移）
+### 5. 建表
 
 ```bash
 alembic upgrade head
-alembic -x db=test upgrade head    # 如需要，测试库用同一套迁移
 ```
 
-> 开发阶段想彻底重建，也可以执行 `psql -U postgres -h 127.0.0.1 -d learn -f init.sql`，但**有真实数据后不要这么做**。
-
-### 5. 启动
+### 6. 启动
 
 ```bash
 uvicorn app.main:app --reload
@@ -84,21 +101,18 @@ uvicorn app.main:app --reload
 ```
 
 ```bash
-# 注册
 curl -X POST http://127.0.0.1:8000/auth/register \
   -H "Content-Type: application/json" \
   -d '{"username":"alice","password":"password123"}'
 
-# 登录（注意是表单，不是 JSON）
 curl -X POST http://127.0.0.1:8000/auth/login \
   -d "username=alice&password=password123"
 
-# 用 token 访问
 curl http://127.0.0.1:8000/users/1/notes \
   -H "Authorization: Bearer <上一步拿到的 token>"
 ```
 
-token 默认 **30 分钟**过期（`app/security.py` 的 `ACCESS_TOKEN_EXPIRE_MINUTES`）。
+token 默认 **30 分钟**过期。
 
 ## 接口
 
@@ -108,41 +122,60 @@ token 默认 **30 分钟**过期（`app/security.py` 的 `ACCESS_TOKEN_EXPIRE_MI
 | POST | `/auth/register` | 否 | 注册 | 201 |
 | POST | `/auth/login` | 否 | 登录，返回 token | 200 |
 | GET | `/users?limit=10` | 否 | 用户列表 | 200 |
-| GET | `/users/{id}` | 否 | 查用户 | 200 |
+| GET | `/users/{id}` | 否 | 查用户（走缓存） | 200 |
 | PUT | `/users/{id}` | 否 | 修改用户名 | 200 |
 | DELETE | `/users/{id}` | 否 | 删除用户（级联删笔记） | 204 |
-| GET | `/users/{id}/notes?limit=10&offset=0` | **是** | 分页查自己的笔记 | 200 |
-| POST | `/users/{id}/notes` | **是** | 给自己的笔记 | 201 |
-| GET | `/notes/{id}` | **是** | 查自己的笔记 | 200 |
-| PUT | `/notes/{id}` | **是** | 修改自己的笔记 | 200 |
-| DELETE | `/notes/{id}` | **是** | 删除自己的笔记 | 204 |
+| GET | `/users/{id}/notes?limit=10&offset=0` | 是 | 分页查自己的笔记 | 200 |
+| POST | `/users/{id}/notes` | 是 | 给自己的笔记 | 201 |
+| GET | `/notes/{id}` | 是 | 查自己的笔记 | 200 |
+| PUT | `/notes/{id}` | 是 | 修改自己的笔记 | 200 |
+| DELETE | `/notes/{id}` | 是 | 删除自己的笔记 | 204 |
 
-### 分页返回
+## 缓存策略
 
-```json
-{
-  "items": [{"id": 1, "title": "...", "...": "..."}],
-  "total": 37,
-  "limit": 10,
-  "offset": 0
-}
+`GET /users/{id}` 采用 **cache-aside**：
+
+```
+读：查缓存 → 命中返回 → 未命中查库 → 回填（TTL 300s ± 30s）
+写：更新数据库 → 删除缓存
 ```
 
-`limit` 上限 100，`offset` 从 0 开始。
+三种缓存问题的处理：
+
+| 问题 | 解法 |
+|---|---|
+| 穿透（查不存在的数据） | 缓存 `__NULL__` 标记，TTL 60 秒 |
+| 击穿（热点 key 过期） | `SET lock:<key> 1 NX EX 10` 互斥锁，只有一个请求回源 |
+| 雪崩（大量 key 同时过期） | 过期时间加 ±30 秒随机抖动 |
+
+## 异步
+
+- 所有路由都是 `async def`
+- 数据库：`AsyncSession` + asyncpg
+- 缓存：`redis.asyncio`
+- 依赖 `asyncio.gather` 并发聚合、`asyncio.wait_for` 超时控制
+
+**注意**：`async def` 里不能调用同步阻塞函数（`time.sleep`、`requests`、同步数据库驱动），否则会卡住整个事件循环。
+
+## Docker
+
+`Dockerfile` 和 `.dockerignore` 已提供（多阶段分层、`.env` 不进镜像）：
+
+```bash
+docker build -t user-resource-api .
+docker run -d --name api -p 8000:8000 \
+  -e DATABASE_URL="postgresql+asyncpg://postgres:密码@host.docker.internal:5432/learn" \
+  -e SECRET_KEY="..." \
+  -e REDIS_URL="redis://host.docker.internal:6379/0" \
+  user-resource-api
+```
+
+> 当前开发机未启用 WSL2（与 VMware 冲突），镜像构建未在本地验证。
 
 ## 错误响应
 
-所有错误统一为：
-
 ```json
 {"error": {"code": "USER_NOT_FOUND", "message": "用户不存在"}}
-```
-
-参数校验失败时多一个 `details`：
-
-```json
-{"error": {"code": "VALIDATION_ERROR", "message": "参数校验失败",
-           "details": [{"field": "body.username", "message": "..."}]}}
 ```
 
 | code | 状态码 | 含义 |
@@ -164,8 +197,10 @@ token 默认 **30 分钟**过期（`app/security.py` 的 `ACCESS_TOKEN_EXPIRE_MI
 pytest -q
 ```
 
-- 使用独立的 `learn_test` 库，每个用例开始前清表
-- 覆盖正常路径、401、403、404、409、422 和分页
+41 个测试，覆盖正常路径、401、403、404、409、422、分页和缓存行为。
+
+- 使用独立的 `learn_test` 库和 Redis 15 号库
+- 每个用例开始前清表、清缓存
 
 ## 项目结构
 
@@ -173,18 +208,20 @@ pytest -q
 user-resource-api/
 ├── app/
 │   ├── main.py           # 组装：lifespan、中间件、异常、路由
-│   ├── db.py             # Engine、Session、get_db
+│   ├── db.py             # AsyncEngine、AsyncSession、get_db
 │   ├── models.py         # SQLAlchemy 模型
 │   ├── schemas.py        # Pydantic 输入输出模型
 │   ├── security.py       # 密码哈希、JWT、get_current_user
+│   ├── cache.py          # Redis 异步客户端与缓存工具
 │   ├── errors.py         # 统一错误响应
 │   ├── logging_conf.py   # 日志格式
 │   └── routers/
 │       ├── auth.py
 │       ├── users.py
 │       └── notes.py
-├── alembic/              # 迁移脚本（要进 Git）
+├── alembic/              # 迁移脚本
 ├── tests/
+├── Dockerfile
 ├── init.sql              # 开发阶段快速重建
 └── requirements.txt
 ```
@@ -192,7 +229,7 @@ user-resource-api/
 ## 已知限制
 
 - 用户列表和改名接口还没加鉴权（只有笔记做了权限控制）
+- 笔记列表没有缓存
 - 没有刷新 token / 注销机制
 - 分页用 offset，数据量很大时会变慢
-- 没有缓存（W6）
-- 只在本地运行，未部署（W7）
+- Docker 镜像未在本机验证（WSL2 与 VMware 冲突）

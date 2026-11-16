@@ -140,10 +140,9 @@ def test_delete_note(client):
 
 
 def test_delete_user_cascades_notes(client):
-    from sqlalchemy import select
+    import os
 
-    from app.db import SessionLocal
-    from app.models import Note
+    import psycopg
 
     headers = _auth(client)
     client.post("/users/1/notes", json={"title": "x"}, headers=headers)
@@ -154,8 +153,6 @@ def test_delete_user_cascades_notes(client):
     assert client.get("/notes/1", headers=headers).status_code == 401
 
     # 笔记确实被外键级联删除了
-    db = SessionLocal()
-    try:
-        assert db.scalar(select(Note).where(Note.id == 1)) is None
-    finally:
-        db.close()
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        row = conn.execute("SELECT id FROM notes WHERE id = 1").fetchone()
+    assert row is None
