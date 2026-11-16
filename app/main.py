@@ -9,10 +9,13 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import engine
-from app.errors import register_error_handlers
+from app.cache import redis_client
+from app.db import engine, get_db
+from app.errors import AppError, register_error_handlers
 from app.logging_conf import setup_logging
 from app.routers import auth, notes, users
 
@@ -64,10 +67,41 @@ app.include_router(users.router)
 app.include_router(notes.router)
 
 
-@app.get("/health", summary="健康检查")
-def health():
-    """健康检查：服务活着就返回 ok。"""
+@app.get("/health", summary="存活检查")
+async def health():
+    """liveness：进程活着就返回 200，不检查依赖。"""
     return {"status": "ok"}
+
+
+@app.get("/health/ready", summary="就绪检查")
+async def readiness(db: AsyncSession = Depends(get_db)):
+    """readiness：数据库和 Redis 都可用才返回 200，否则 503。"""
+    checks = {}
+
+    # TODO 1：检查数据库
+    # 成功：checks["database"] = "ok"
+    # 失败：checks["database"] = "error"
+    # 提示：await db.execute(text("SELECT 1"))
+    try:
+        await db.execute(text("SELECT 1"))
+        checks["database"] = "ok"
+    except Exception:
+        checks["database"] = "error"
+
+    # TODO 2：检查 Redis
+    # 成功：checks["redis"] = "ok"
+    # 失败：checks["redis"] = "error"
+    # 提示：await redis_client.ping()
+    try:
+        await redis_client.ping()
+        checks["redis"] = "ok"
+    except Exception:
+        checks["redis"] = "error"
+
+    if any(v != "ok" for v in checks.values()):
+        raise AppError(503, "NOT_READY", f"依赖不可用: {checks}")
+
+    return {"status": "ok", "checks": checks}
 
 
 @app.get("/")

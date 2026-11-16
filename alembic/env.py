@@ -19,8 +19,11 @@ if config.config_file_name is not None:
 from app.db import DATABASE_URL
 from app.models import Base
 
-# 连接串统一从 app/db.py 读，不在 alembic.ini 里再写一份密码
-config.set_main_option("sqlalchemy.url", DATABASE_URL)
+# Alembic 的默认模板是同步的，用 psycopg 跑迁移；
+# 应用的运行时连接仍用 asyncpg。
+SYNC_DATABASE_URL = DATABASE_URL.replace("+asyncpg", "+psycopg")
+
+config.set_main_option("sqlalchemy.url", SYNC_DATABASE_URL)
 target_metadata = Base.metadata
 
 # other values from the config, defined by the needs of env.py,

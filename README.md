@@ -157,6 +157,85 @@ token 默认 **30 分钟**过期。
 
 **注意**：`async def` 里不能调用同步阻塞函数（`time.sleep`、`requests`、同步数据库驱动），否则会卡住整个事件循环。
 
+## 健康检查
+
+| 端点 | 类型 | 检查内容 | 依赖故障时 |
+|---|---|---|---|
+| `GET /health` | liveness | 只确认进程活着 | 200 |
+| `GET /health/ready` | readiness | PostgreSQL `SELECT 1` + Redis `PING` | **503**，并返回具体是哪个依赖 |
+
+```bash
+curl -s http://127.0.0.1:8000/health/ready
+# {"status":"ok","checks":{"database":"ok","redis":"ok"}}
+```
+
+**为什么分开**：liveness 检查数据库会导致「数据库抖一下，容器被反复重启」；readiness 才负责决定要不要接流量。
+
+## 压测
+
+压测脚本：`locustfile.py`
+
+```bash
+locust -f locustfile.py --host http://127.0.0.1:8000 \
+  --headless -u 50 -r 10 -t 30s --only-summary
+```
+
+本机实测（Windows、单进程 uvicorn、PostgreSQL 和 Redis 同机）：
+
+| 并发 | QPS | 平均延迟 | P95 | P99 | 错误率 |
+|---|---|---|---|---|---|
+| 50 | 350 | 6 ms | 9 ms | 15 ms | 0% |
+| 200 | 751 | 79 ms | 350 ms | 420 ms | 0% |
+
+按接口拆开（200 并发）：
+
+| 接口 | QPS | P95 | 说明 |
+|---|---|---|---|
+| `GET /users/{id}` | 529 | 74 ms | 走 Redis 缓存 |
+| `GET /users?limit=10` | 146 | 430 ms | 每次查库 |
+| `GET /health` | 76 | 53 ms | 不查库 |
+
+**结论**：
+
+- 缓存接口的 QPS 是查库接口的 3.6 倍，P95 低 5.8 倍
+- 200 并发时列表接口开始排队，怀疑数据库连接池（最多 15 条）成为瓶颈
+- 日志每请求写一行 stdout，Windows 终端 IO 会拖累事件循环（健康检查延迟也上涨）
+
+**优化方向**：调大连接池、日志异步化、uvicorn 多 worker。
+
+## Nginx 反向代理
+
+```nginx
+server {
+    listen 80;
+    server_name localhost;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # SSE 流式输出：关闭缓冲
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 300s;
+    }
+}
+```
+
+验证：`http://127.0.0.1/docs` 通过 80 端口能打开。
+
+## CI
+
+`.github/workflows/ci.yml`：
+
+- 每次 push / PR 自动运行
+- 起 PostgreSQL 18 和 Redis 7 作为 service 容器
+- 安装依赖 → `alembic upgrade head` → `pytest -q`
+- 使用测试专用密码，不碰真实配置
+
 ## Docker
 
 `Dockerfile` 和 `.dockerignore` 已提供（多阶段分层、`.env` 不进镜像）：
@@ -171,6 +250,22 @@ docker run -d --name api -p 8000:8000 \
 ```
 
 > 当前开发机未启用 WSL2（与 VMware 冲突），镜像构建未在本地验证。
+
+### Docker Compose
+
+`docker-compose.yml` 定义三个服务：`api`、`db`（PostgreSQL 18）、`redis`（Redis 7）。
+
+```bash
+docker compose up -d
+docker compose exec api alembic upgrade head   # 首次启动后建表
+```
+
+要点：
+
+- 容器之间用服务名互相访问（`db:5432`、`redis:6379`），不是 `localhost`
+- `depends_on` 配合 `condition: service_healthy`，等数据库真正可用再启动 API
+- 数据用 volume 持久化（`pgdata`、`redisdata`）
+- 密码从宿主机的 `.env` 注入，不写进镜像
 
 ## 错误响应
 
@@ -197,7 +292,7 @@ docker run -d --name api -p 8000:8000 \
 pytest -q
 ```
 
-41 个测试，覆盖正常路径、401、403、404、409、422、分页和缓存行为。
+45 个测试，覆盖正常路径、401、403、404、409、422、分页、缓存行为和健康检查。
 
 - 使用独立的 `learn_test` 库和 Redis 15 号库
 - 每个用例开始前清表、清缓存
@@ -232,4 +327,6 @@ user-resource-api/
 - 笔记列表没有缓存
 - 没有刷新 token / 注销机制
 - 分页用 offset，数据量很大时会变慢
-- Docker 镜像未在本机验证（WSL2 与 VMware 冲突）
+- 日志同步写 stdout，高并发下会成为瓶颈
+- Docker 镜像和 Compose 未在本机验证（WSL2 与 VMware 冲突）
+- 尚未部署到云服务器，没有公网访问和线上压测数据
